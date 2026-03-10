@@ -1,9 +1,13 @@
+import logging
 import sys
-from datetime import datetime
+from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 import argparse
 import questionary
+import requests
 from colorama import Fore, Style
+
+_log = logging.getLogger(__name__)
 
 from src.utils.analysts import ANALYST_ORDER
 from src.llm.models import LLM_ORDER, OLLAMA_LLM_ORDER, get_model_info, ModelProvider, find_model_by_name
@@ -11,6 +15,26 @@ from src.utils.ollama import ensure_ollama_and_model
 
 from dataclasses import dataclass
 from typing import Optional
+
+
+def get_earnings_today(target_date: str | None = None) -> list[str]:
+    """
+    Fetch tickers reporting earnings on a given date (default: today) from Nasdaq.
+    Returns a list of ticker symbols sorted alphabetically.
+    """
+    day = target_date or date.today().strftime("%Y-%m-%d")
+    url = f"https://api.nasdaq.com/api/calendar/earnings?date={day}"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; ai-hedge-fund/1.0)"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        rows = (data.get("data") or {}).get("rows") or []
+        tickers = sorted({r["symbol"].strip().upper() for r in rows if r.get("symbol")})
+        return tickers
+    except Exception as exc:
+        _log.warning("Failed to fetch earnings calendar for %s: %s", day, exc)
+        return []
 
 
 def add_common_args(
@@ -23,8 +47,20 @@ def add_common_args(
     parser.add_argument(
         "--tickers",
         type=str,
-        required=require_tickers,
+        required=False,  # optional when --earnings-today / --earnings-date is used
         help="Comma-separated list of stock ticker symbols (e.g., AAPL,MSFT,GOOGL)",
+    )
+    parser.add_argument(
+        "--earnings-today",
+        action="store_true",
+        help="Fetch all tickers reporting earnings today from Nasdaq and run analysis on them",
+    )
+    parser.add_argument(
+        "--earnings-date",
+        dest="earnings_date",
+        type=str,
+        default=None,
+        help="Fetch tickers reporting earnings on a specific date (YYYY-MM-DD). Implies --earnings-today behaviour.",
     )
     if include_analyst_flags:
         parser.add_argument(
@@ -278,7 +314,22 @@ def parse_cli_inputs(
     args = parser.parse_args()
 
     # Normalize parsed values
-    tickers = parse_tickers(getattr(args, "tickers", None))
+    # --earnings-today / --earnings-date override --tickers
+    earnings_date = getattr(args, "earnings_date", None)
+    use_earnings = getattr(args, "earnings_today", False) or earnings_date
+    if use_earnings:
+        day_label = earnings_date or date.today().strftime("%Y-%m-%d")
+        print(f"\n{Fore.CYAN}Fetching earnings calendar for {day_label}...{Style.RESET_ALL}")
+        earnings_tickers = get_earnings_today(earnings_date)
+        if not earnings_tickers:
+            print(f"{Fore.RED}No earnings found for {day_label}. Markets may be closed or data unavailable.{Style.RESET_ALL}")
+            sys.exit(1)
+        print(f"{Fore.GREEN}Found {len(earnings_tickers)} tickers reporting earnings: {', '.join(earnings_tickers[:20])}{'...' if len(earnings_tickers) > 20 else ''}{Style.RESET_ALL}\n")
+        tickers = earnings_tickers
+    else:
+        tickers = parse_tickers(getattr(args, "tickers", None))
+        if not tickers:
+            parser.error("--tickers is required unless --earnings-today or --earnings-date is specified")
     selected_analysts = select_analysts({
         "analysts_all": getattr(args, "analysts_all", False),
         "analysts": getattr(args, "analysts", None),
