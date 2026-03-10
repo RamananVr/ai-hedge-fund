@@ -1,13 +1,35 @@
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 import argparse
 import questionary
 import requests
+import yfinance as yf
 from colorama import Fore, Style
 
 _log = logging.getLogger(__name__)
+
+# Sector keyword → yfinance sector/industry match strings
+_SECTOR_ALIASES: dict[str, tuple[list[str], list[str]]] = {
+    # (sector substrings, industry substrings) — all case-insensitive
+    "technology": (["technology"], []),
+    "tech":       (["technology"], []),
+    "energy":     (["energy"], []),
+    "biotech":    (["healthcare"], ["biotech"]),
+    "pharma":     (["healthcare"], ["pharma", "drug"]),
+    "healthcare": (["healthcare"], []),
+    "finance":    (["financial"], []),
+    "financial":  (["financial"], []),
+    "consumer":   (["consumer"], []),
+    "industrial": (["industrial"], []),
+    "utilities":  (["utilities"], []),
+    "materials":  (["basic materials"], []),
+    "realestate": (["real estate"], []),
+    "communication": (["communication"], []),
+    "telecom":    (["communication"], []),
+}
 
 from src.utils.analysts import ANALYST_ORDER
 from src.llm.models import LLM_ORDER, OLLAMA_LLM_ORDER, get_model_info, ModelProvider, find_model_by_name
@@ -17,10 +39,42 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-def get_earnings_today(target_date: str | None = None) -> list[str]:
+def _ticker_sector(symbol: str) -> tuple[str, str, str]:
+    """Return (symbol, sector, industry) from yfinance — used for parallel fetching."""
+    try:
+        info = yf.Ticker(symbol).info
+        return symbol, (info.get("sector") or ""), (info.get("industry") or "")
+    except Exception:
+        return symbol, "", ""
+
+
+def _matches_sector(sector: str, industry: str, filter_key: str) -> bool:
+    """Return True if the ticker's sector/industry matches the requested filter."""
+    sec_lo, ind_lo = sector.lower(), industry.lower()
+    sector_kws, industry_kws = _SECTOR_ALIASES.get(filter_key.lower(), ([filter_key.lower()], []))
+    if sector_kws and not any(k in sec_lo for k in sector_kws):
+        return False
+    if industry_kws and not any(k in ind_lo for k in industry_kws):
+        return False
+    return True
+
+
+def get_earnings_today(
+    target_date: str | None = None,
+    sector: str | None = None,
+) -> list[str]:
     """
     Fetch tickers reporting earnings on a given date (default: today) from Nasdaq.
-    Returns a list of ticker symbols sorted alphabetically.
+
+    Args:
+        target_date: YYYY-MM-DD string, defaults to today.
+        sector: Optional sector filter. Supported keywords:
+                technology/tech, energy, biotech, pharma, healthcare,
+                finance/financial, consumer, industrial, utilities,
+                materials, realestate, communication/telecom.
+
+    Returns:
+        Sorted list of ticker symbols.
     """
     day = target_date or date.today().strftime("%Y-%m-%d")
     url = f"https://api.nasdaq.com/api/calendar/earnings?date={day}"
@@ -31,10 +85,25 @@ def get_earnings_today(target_date: str | None = None) -> list[str]:
         data = resp.json()
         rows = (data.get("data") or {}).get("rows") or []
         tickers = sorted({r["symbol"].strip().upper() for r in rows if r.get("symbol")})
-        return tickers
     except Exception as exc:
         _log.warning("Failed to fetch earnings calendar for %s: %s", day, exc)
         return []
+
+    if not sector:
+        return tickers
+
+    # Enrich with sector data in parallel (one yfinance call per ticker)
+    filter_key = sector.strip().lower().replace(" ", "")
+    print(f"{Fore.CYAN}Filtering {len(tickers)} tickers by sector '{sector}' (fetching sector data)...{Style.RESET_ALL}")
+    matched: list[str] = []
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_ticker_sector, t): t for t in tickers}
+        for future in as_completed(futures):
+            sym, sec, ind = future.result()
+            if _matches_sector(sec, ind, filter_key):
+                matched.append(sym)
+
+    return sorted(matched)
 
 
 def add_common_args(
@@ -61,6 +130,16 @@ def add_common_args(
         type=str,
         default=None,
         help="Fetch tickers reporting earnings on a specific date (YYYY-MM-DD). Implies --earnings-today behaviour.",
+    )
+    parser.add_argument(
+        "--sector",
+        type=str,
+        default=None,
+        help=(
+            "Filter earnings tickers by sector. Works with --earnings-today / --earnings-date. "
+            "Options: technology, energy, biotech, pharma, healthcare, finance, "
+            "consumer, industrial, utilities, materials, realestate, communication"
+        ),
     )
     if include_analyst_flags:
         parser.add_argument(
@@ -319,8 +398,9 @@ def parse_cli_inputs(
     use_earnings = getattr(args, "earnings_today", False) or earnings_date
     if use_earnings:
         day_label = earnings_date or date.today().strftime("%Y-%m-%d")
+        sector_filter = getattr(args, "sector", None)
         print(f"\n{Fore.CYAN}Fetching earnings calendar for {day_label}...{Style.RESET_ALL}")
-        earnings_tickers = get_earnings_today(earnings_date)
+        earnings_tickers = get_earnings_today(earnings_date, sector=sector_filter)
         if not earnings_tickers:
             print(f"{Fore.RED}No earnings found for {day_label}. Markets may be closed or data unavailable.{Style.RESET_ALL}")
             sys.exit(1)
